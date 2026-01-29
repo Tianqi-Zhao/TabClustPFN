@@ -30,7 +30,7 @@ nohup env PYTHONUNBUFFERED=1 torchrun --nproc_per_node=4 --rdzv_backend=c10d --r
             --dtype float32 \
             --np_seed 42 \
             --torch_seed 42 \
-            --max_steps 50000 \
+            --max_steps 10000 \
             --batch_size 512 \
             --micro_batch_size 4 \
             --optimizer adamw \
