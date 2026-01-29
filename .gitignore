@@ -1,0 +1,16 @@
+**/__pycache__/
+__pycache__/
+logs/
+checkpoints*/
+data/
+nohup.out
+.vscode/
+*.log
+*.tar.gz
+benchmarks/
+docs/
+cin_output/
+*.pdf
+tabclustpfn_representation/
+vis/
+results_time.txt

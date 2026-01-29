@@ -1,0 +1,1 @@
+R_HOME_PATH = '/path/to/R'
