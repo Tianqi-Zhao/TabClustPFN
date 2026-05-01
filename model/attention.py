@@ -1,3 +1,11 @@
+# This file is derived from TabICL (https://github.com/soda-inria/tabicl).
+# Original code: Copyright (c) 2025, Inria. All rights reserved.
+# Licensed under the BSD 3-Clause License. See `licenses/LICENSE-TABICL` for
+# the original license text.
+#
+# Modifications Copyright (c) 2026, TabClustPFN authors.
+# Modifications licensed under CC BY-NC 4.0
+# (https://creativecommons.org/licenses/by-nc/4.0/).
 from __future__ import annotations
 from typing import Optional, Tuple
 
