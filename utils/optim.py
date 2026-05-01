@@ -393,17 +393,13 @@ class AdaptiveStageSGDWrapper:
     def record_loss(self, loss: float):
         """Record the loss value for the current step."""
         if self.use_ema:
-            # 使用EMA模式
             if self.ema_loss is None:
-                # 第一次记录，初始化EMA
                 self.ema_loss = loss
                 self.ema_loss_sq = loss ** 2
             else:
-                # 更新EMA
                 self.ema_loss = self.ema_beta * self.ema_loss + (1 - self.ema_beta) * loss
                 self.ema_loss_sq = self.ema_beta * self.ema_loss_sq + (1 - self.ema_beta) * (loss ** 2)
         else:
-            # 使用滑动窗口模式
             self.loss_history.append(loss)
         
         self.step_count += 1
@@ -593,7 +589,6 @@ class AdaptiveStageSGDWrapper:
         
         use_ema = state_dict.get('use_ema', False)  # backward compatibility
         if use_ema and self.use_ema:
-            # EMA模式
             self.ema_loss = state_dict.get('ema_loss')
             self.ema_loss_sq = state_dict.get('ema_loss_sq')
         elif not use_ema and not self.use_ema:
