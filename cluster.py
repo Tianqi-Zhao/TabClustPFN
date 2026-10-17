@@ -83,6 +83,7 @@ def cluster(
     num_clusters: Optional[int] = None,
     device: str = "cpu",
     use_amp: bool = False,
+    k_batch_size: int | None = None,
 ) -> tuple[np.ndarray, int]:
     """
     Perform clustering on preprocessed data.
@@ -99,6 +100,9 @@ def cluster(
         Device to run inference on
     use_amp : bool
         Whether to use automatic mixed precision
+    k_batch_size : int or None
+        Candidate k values per call when predicting k. None batches all
+        candidates; 1 evaluates them sequentially.
         
     Returns
     -------
@@ -122,6 +126,7 @@ def cluster(
         COL_CONFIG=mgr_config,
         ROW_CONFIG=mgr_config,
         CLUSTER_CONFIG=mgr_config,
+        K_BATCH_SIZE=k_batch_size,
     )
     
     model.eval()
@@ -221,6 +226,12 @@ def main():
         help="Number of clusters. If not specified, the model will predict it automatically."
     )
     parser.add_argument(
+        "--k_batch_size",
+        type=int,
+        default=None,
+        help="Candidate k values per call (default: all). Use 1 for sequential evaluation."
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cpu",
@@ -264,6 +275,8 @@ def main():
     )
     
     args = parser.parse_args()
+    if args.k_batch_size is not None and args.k_batch_size < 1:
+        parser.error("--k_batch_size must be a positive integer")
     
     # Check CUDA availability
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -314,6 +327,7 @@ def main():
         num_clusters=args.num_clusters,
         device=args.device,
         use_amp=args.amp,
+        k_batch_size=args.k_batch_size,
     )
     
     print(f"Clustering complete!")

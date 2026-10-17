@@ -36,6 +36,7 @@ python cluster.py --checkpoint /path/to/checkpoint.ckpt --data your_data.csv --l
 | `--data, -d` | Path to input CSV file (required) |
 | `--output, -o` | Path to save predictions |
 | `--num_clusters, -k` | Number of clusters (auto-predicted if not specified) |
+| `--k_batch_size` | Candidate k values per batch for automatic k prediction (default: all; `1`: sequential) |
 | `--device` | `cpu` or `cuda` (default: cpu) |
 | `--amp` | Enable mixed precision (CUDA only) |
 | `--nan_strategy` | Handle NaN: `zero`, `mean`, `median`, `mode` |

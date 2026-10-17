@@ -123,13 +123,20 @@ class MgrConfig:
 
 @dataclass
 class InferenceConfig:
-    """Configuration class for inference."""
+    """Inference settings, including how many candidate k values to batch.
+
+    K_BATCH_SIZE=None batches all candidates; 1 evaluates them sequentially.
+    A positive integer limits each call to that many candidates. This setting
+    only applies to inference with predict_k=True.
+    """
 
     COL_CONFIG: MgrConfig = None
     ROW_CONFIG: MgrConfig = None
     CLUSTER_CONFIG: MgrConfig = None
+    K_BATCH_SIZE: int | None = None
 
     def __post_init__(self):
+        self.validate_k_batch_size(self.K_BATCH_SIZE)
         if isinstance(self.COL_CONFIG, dict):
             self.COL_CONFIG = MgrConfig(**self.COL_CONFIG)
         elif self.COL_CONFIG is None:
@@ -175,22 +182,36 @@ class InferenceConfig:
         elif not isinstance(self.CLUSTER_CONFIG, MgrConfig):
             raise TypeError(f"CLUSTER_CONFIG must be a dict or MgrConfig, got {type(self.CLUSTER_CONFIG)}")
 
-    def update_from_dict(self, config_dict: Dict[str, Dict]):
+    @staticmethod
+    def validate_k_batch_size(value: int | None) -> None:
+        if value is None:
+            return
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("K_BATCH_SIZE must be None or a positive integer")
+        if value < 1:
+            raise ValueError("K_BATCH_SIZE must be a positive integer")
+
+    def update_from_dict(self, config_dict: Dict[str, Dict | int | None]):
         """Update configurations from a dictionary.
 
         Parameters
         ----------
-        config_dict : Dict[str, Dict]
+        config_dict : dict
             Dictionary containing configuration updates for COL_CONFIG, ROW_CONFIG, and/or CLUSTER_CONFIG
+            and an optional K_BATCH_SIZE value.
 
         Raises
         ------
         KeyError
             If dictionary contains keys other than the allowed configuration names
         """
-        allowed_keys = {"COL_CONFIG", "ROW_CONFIG", "CLUSTER_CONFIG"}
+        allowed_keys = {"COL_CONFIG", "ROW_CONFIG", "CLUSTER_CONFIG", "K_BATCH_SIZE"}
         for key in config_dict:
             if key not in allowed_keys:
                 raise KeyError(f"Invalid config key: {key}. Allowed keys: {allowed_keys}")
 
-            getattr(self, key).update(config_dict[key])
+            if key == "K_BATCH_SIZE":
+                self.validate_k_batch_size(config_dict[key])
+                self.K_BATCH_SIZE = config_dict[key]
+            else:
+                getattr(self, key).update(config_dict[key])

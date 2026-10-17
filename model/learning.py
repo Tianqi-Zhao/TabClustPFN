@@ -120,14 +120,16 @@ class ClusterLearningIMAB(nn.Module):
         # InferenceManager for single output
         self.inference_mgr = InferenceManager(
             enc_name="tf_dataset", 
-            out_dim=max_classes
+            out_dim=max_classes,
+            preserve_output_dtype=True,
         )
         
         self.inference_mgr_multi = InferenceManager(
             enc_name="tf_dataset",
             out_dim=max_classes,
             out_dims=[max_classes, d_model, (num_inds, d_model)],  # [logits: (..., T, max_classes), query_norm: (..., T, d_model), key_norm: (..., num_inds, d_model)]
-            out_no_seq=[False, False, True]  # logits and query_norm have seq_len, key_norm doesn't
+            out_no_seq=[False, False, True],  # logits and query_norm have seq_len, key_norm doesn't
+            preserve_output_dtype=True,
         )
 
     def _create_ind_key_padding_mask(self, num_classes: Tensor) -> Tensor:

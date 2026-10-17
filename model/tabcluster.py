@@ -210,12 +210,13 @@ class TabClusterIMAB(nn.Module):
         row_representations: Tensor,
         mgr_config = None,
         return_hidden: bool = False,
+        k_batch_size: int | None = None,
     ) -> list | tuple[list, list, list]:
         """Compute logits for all possible num_classes values (2 to max_classes).
         
-        This method computes logits for each k value using eval mode to ensure:
-        1. Consistent outputs across different k values (no dropout randomness)
-        2. Deterministic K prediction during both training and inference
+        Candidate k values share the ordinary batch dimension, with a separate
+        num_classes mask for each element. Eval mode disables dropout for these
+        candidates, including when this method is called during training.
         
         The logits are computed with torch.no_grad() since they will be detached
         anyway when computing G matrices for K prediction.
@@ -228,6 +229,9 @@ class TabClusterIMAB(nn.Module):
             Configuration for InferenceManager (used in inference mode)
         return_hidden : bool, default=False
             If True, also return query_norm and key_norm for each k value.
+        k_batch_size : int or None, default=None
+            Candidates per call; None batches all candidates. Training explicitly
+            passes 1, while inference passes InferenceConfig.K_BATCH_SIZE.
             
         Returns
         -------
@@ -241,8 +245,10 @@ class TabClusterIMAB(nn.Module):
                 - all_query_norms: List of query_norm for k=2,...,max_classes
                 - all_key_norms: List of key_norm for k=2,...,max_classes
         """
-        B = row_representations.shape[0]
+        InferenceConfig.validate_k_batch_size(k_batch_size)
+        B, T, D = row_representations.shape
         device = row_representations.device
+        chunk_size = self.max_classes - 1 if k_batch_size is None else k_batch_size
         
         all_logits = []
         all_query_norms = [] if return_hidden else None
@@ -254,38 +260,35 @@ class TabClusterIMAB(nn.Module):
         # Use eval mode for consistent K prediction (disable dropout)
         self.cluster_learner.eval()
         
-        with torch.no_grad():
-            # Iterate over k = 2, 3, ..., max_classes
-            for k in range(2, self.max_classes + 1):
-                # Create uniform num_classes tensor for this k
-                num_classes_k = torch.full((B,), k, dtype=torch.long, device=device)
-                
-                # Call cluster_learner in eval mode
-                if return_hidden:
-                    logits_k, query_norm_k, key_norm_k = self.cluster_learner(
-                        row_representations, 
-                        num_classes=num_classes_k,
+        try:
+            with torch.no_grad():
+                for start in range(2, self.max_classes + 1, chunk_size):
+                    stop = min(start + chunk_size, self.max_classes + 1)
+                    count = stop - start
+                    # k-major order: all B tables for the first k, then the next.
+                    representations = row_representations.unsqueeze(0).expand(count, -1, -1, -1)
+                    representations = representations.reshape(count * B, T, D)
+                    num_classes = torch.arange(start, stop, device=device).repeat_interleave(B)
+                    outputs = self.cluster_learner(
+                        representations,
+                        num_classes=num_classes,
                         mgr_config=mgr_config,
-                        return_hidden=True, 
+                        return_hidden=return_hidden,
                     )
-                    all_query_norms.append(query_norm_k)
-                    all_key_norms.append(key_norm_k)
-                else:
-                    logits_k = self.cluster_learner(
-                        row_representations, 
-                        num_classes=num_classes_k,
-                        mgr_config=mgr_config,
-                        return_hidden=False, 
-                    )
-                
-                # Only keep the first k columns of logits (others are -inf anyway)
-                # logits_k shape: (B, T, max_classes) -> (B, T, k)
-                logits_k = logits_k[:, :, :k]
-                all_logits.append(logits_k)
-
-        # Restore original training state
-        if was_training:
-            self.cluster_learner.train()
+                    if return_hidden:
+                        logits, query_norms, key_norms = outputs
+                        all_query_norms.extend(
+                            query_norms.reshape(count, B, *query_norms.shape[1:]).unbind(0)
+                        )
+                        all_key_norms.extend(
+                            key_norms.reshape(count, B, *key_norms.shape[1:]).unbind(0)
+                        )
+                    else:
+                        logits = outputs
+                    logits = logits.reshape(count, B, T, self.max_classes)
+                    all_logits.extend(logits[i, :, :, :k] for i, k in enumerate(range(start, stop)))
+        finally:
+            self.cluster_learner.train(was_training)
         
         if return_hidden:
             return all_logits, all_query_norms, all_key_norms
@@ -334,14 +337,14 @@ class TabClusterIMAB(nn.Module):
         row_representations = self.row_interactor(self.col_embedder(X, d=d), d=d)
         
         if predict_k:
-            # Compute logits for all k values
-            # When return_hidden=True, also get query_norm and key_norm for each k
+            # Preserve the training schedule explicitly; the helper defaults to all k.
+            outputs = self._compute_all_k_logits(
+                row_representations, return_hidden=return_hidden, k_batch_size=1
+            )
             if return_hidden:
-                all_k_logits, all_query_norms, all_key_norms = self._compute_all_k_logits(
-                    row_representations, return_hidden=True
-                )
+                all_k_logits, all_query_norms, all_key_norms = outputs
             else:
-                all_k_logits = self._compute_all_k_logits(row_representations, return_hidden=False)
+                all_k_logits = outputs
             
             # Compute G matrices and k_logits
             k_logits = self.k_decision(all_k_logits)  # (B, max_classes - 1)
@@ -382,7 +385,8 @@ class TabClusterIMAB(nn.Module):
         ----------
         predict_k : bool, default=False
             If True, compute all k logits and predict k using MLP.
-            Uses InferenceManager for each k value for efficient batch splitting.
+            Batches candidates according to inference_config.K_BATCH_SIZE and
+            reuses InferenceManager for batch splitting.
         
         Returns
         -------
@@ -405,16 +409,16 @@ class TabClusterIMAB(nn.Module):
         )
         
         if predict_k:
-            # Compute logits for all k values
-            # When return_hidden=True, also get query_norm and key_norm for each k
+            outputs = self._compute_all_k_logits(
+                row_representations,
+                mgr_config=inference_config.ROW_CONFIG,
+                return_hidden=return_hidden,
+                k_batch_size=inference_config.K_BATCH_SIZE,
+            )
             if return_hidden:
-                all_k_logits, all_query_norms, all_key_norms = self._compute_all_k_logits(
-                    row_representations, mgr_config=inference_config.ROW_CONFIG, return_hidden=True
-                )
+                all_k_logits, all_query_norms, all_key_norms = outputs
             else:
-                all_k_logits = self._compute_all_k_logits(
-                    row_representations, mgr_config=inference_config.ROW_CONFIG, return_hidden=False
-                )
+                all_k_logits = outputs
             
             # Compute G matrices and k_logits
             k_logits = self.k_decision(all_k_logits)  # (B, max_classes - 1)

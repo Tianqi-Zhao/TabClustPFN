@@ -174,11 +174,23 @@ class InferenceManager:
         Examples:
         - out_dims=[100, 200] means outputs have shapes (..., 100) and (..., 200)
         - out_dims=[100, (50, 2)] means outputs have shapes (..., 100) and (..., 50, 2)
+
+    preserve_output_dtype : bool, default=False
+        Allocate split outputs using each forward output's dtype, instead of
+        the input dtype. This keeps AMP outputs consistent with unsplit calls.
     """
 
-    def __init__(self, enc_name: str, out_dim: int, out_no_seq: bool | List[bool] = False, out_dims: Optional[List[int | Tuple[int, ...]]] = None):
+    def __init__(
+        self,
+        enc_name: str,
+        out_dim: int,
+        out_no_seq: bool | List[bool] = False,
+        out_dims: Optional[List[int | Tuple[int, ...]]] = None,
+        preserve_output_dtype: bool = False,
+    ):
         self.enc_name = enc_name
         self.out_dim = out_dim
+        self.preserve_output_dtype = preserve_output_dtype
         
         # Normalize out_dims to list of tuples for consistency
         if out_dims is not None:
@@ -416,35 +428,11 @@ class InferenceManager:
             )
 
         if not auto_batch:
-            # Move inputs to execution device
-            inputs_on_exe = {}
-            for name, value in inputs.items():
-                if isinstance(value, torch.Tensor):
-                    inputs_on_exe[name] = self.to_exe_device(value)
-                else:
-                    inputs_on_exe[name] = value
+            return self._offload_outputs(self._run_forward(forward_fn, inputs))
 
-            with torch.no_grad():
-                if self.use_amp and self.exe_device.type == "cuda":
-                    with torch.autocast(device_type="cuda"):
-                        outputs = forward_fn(**inputs_on_exe)
-                else:
-                    outputs = forward_fn(**inputs_on_exe)
-
-            # Move to CPU if needed
-            if self.offload:
-                if self.out_dims is not None and isinstance(outputs, tuple):
-                    # Multi-output mode: move all tensors to CPU
-                    return tuple(out.to(device="cpu") for out in outputs)
-                else:
-                    return outputs.to(device="cpu")
-            else:
-                return outputs
-
-        # CPU does not support batching temporarily
+        # CPU does not support automatic batching.
         if self.exe_device.type == "cpu":
-            with torch.no_grad():
-                return forward_fn(**inputs)
+            return self._run_forward(forward_fn, inputs)
 
         # Extract dimension and dtype information from first tensor
         first_value = next(iter(inputs.values()))
@@ -462,9 +450,6 @@ class InferenceManager:
         *batch_dims, seq_len, in_dim = first_value.shape
         input_dtype = first_value.dtype
         inputs_on_cuda = first_value.is_cuda
-
-        # Calculate total batch size across all batch dimensions
-        total_bs = math.prod(batch_dims)
 
         # Estimate batch size based on available memory
         gpu_mem, batch_size = self.estimate_safe_batch_size(seq_len, include_inputs=not inputs_on_cuda, in_dim=in_dim)
@@ -526,125 +511,111 @@ class InferenceManager:
                     f"Offloading to CPU: {self.offload}"
                 )
 
-        # If we can process all data in one batch, do it
-        if batch_size >= total_bs:
-            # Move inputs to execution device
-            inputs_on_exe = {}
-            for name, value in inputs.items():
-                if isinstance(value, torch.Tensor):
-                    inputs_on_exe[name] = self.to_exe_device(value)
-                else:
-                    inputs_on_exe[name] = value
+        if self.out_dims is None:
+            output_shapes = [output_shape]
+        return self._batched_forward(forward_fn, inputs, batch_dims, batch_size, output_shapes)
 
-            with torch.no_grad():
-                if self.use_amp and self.exe_device.type == "cuda":
-                    with torch.autocast(device_type="cuda"):
-                        outputs = forward_fn(**inputs_on_exe)
-                else:
-                    outputs = forward_fn(**inputs_on_exe)
+    def _run_forward(
+        self, forward_fn: Callable, inputs: Dict[str, Any]
+    ) -> Tensor | Tuple[Tensor, ...]:
+        """Apply the same device, gradient and AMP policy to every forward call."""
+        inputs_on_exe = {
+            name: self.to_exe_device(value) if isinstance(value, Tensor) else value
+            for name, value in inputs.items()
+        }
+        with torch.no_grad():
+            if self.use_amp and self.exe_device.type == "cuda":
+                with torch.autocast(device_type="cuda"):
+                    return forward_fn(**inputs_on_exe)
+            return forward_fn(**inputs_on_exe)
 
-            # Move to CPU if needed
-            if self.offload:
-                if self.out_dims is not None and isinstance(outputs, tuple):
-                    # Multi-output mode: move all tensors to CPU
-                    return tuple(out.to(device="cpu") for out in outputs)
-                else:
-                    return outputs.to(device="cpu")
-            else:
-                return outputs
+    def _offload_outputs(self, outputs: Tensor | Tuple[Tensor, ...]) -> Tensor | Tuple[Tensor, ...]:
+        if not self.offload:
+            return outputs
+        if isinstance(outputs, tuple):
+            return tuple(output.cpu() for output in outputs)
+        return outputs.cpu()
 
-        # Pre-allocate output tensor(s) with same dtype as input
-        output_device = torch.device("cpu") if self.offload else self.exe_device
-        
-        if self.out_dims is not None:
-            # Multi-output mode: pre-allocate multiple tensors
-            outputs = tuple(
-                torch.empty(shape, dtype=input_dtype, device=output_device)
-                for shape in output_shapes
-            )
-        else:
-            # Single output mode
-            outputs = torch.empty(output_shape, dtype=input_dtype, device=output_device)
-
-        # Main inference loop with OOM recovery
+    @torch.no_grad()
+    def _batched_forward(
+        self,
+        forward_fn: Callable,
+        inputs: Dict[str, Any],
+        batch_dims: Tuple[int, ...],
+        batch_size: int,
+        output_shapes: List[Tuple[int, ...]],
+    ) -> Tensor | Tuple[Tensor, ...]:
+        """Execute a batch plan, merging outputs and retrying CUDA OOMs."""
+        batch_size = min(batch_size, math.prod(batch_dims))
         while True:
             try:
-                # Calculate how to split batch dimensions based on estimated batch size
-                split_sizes = self.compute_split_sizes(batch_dims, batch_size)
-                # Create batches based on the calculated structure
-                n_batches = self.compute_n_batches(batch_dims, split_sizes)
-                batch_iterator = self.create_multidim_batches(inputs, batch_dims, split_sizes)
-
-                if self.verbose:
-                    batch_iterator = tqdm(
-                        batch_iterator, total=n_batches, desc=f"Processing {self.enc_name}", unit="batch"
-                    )
-
-                for batch_dict, indices in batch_iterator:
-                    with torch.no_grad():
-                        if self.use_amp and self.exe_device.type == "cuda":
-                            with torch.autocast(device_type="cuda"):
-                                output = forward_fn(**batch_dict)
-                        else:
-                            output = forward_fn(**batch_dict)
-
-                        if self.out_dims is not None:
-                            # Multi-output mode: handle tuple of outputs
-                            if not isinstance(output, tuple):
-                                raise ValueError(f"Expected tuple output when out_dims is specified, got {type(output)}")
-                            
-                            if len(output) != len(self.out_dims_normalized):
-                                raise ValueError(
-                                    f"Number of outputs ({len(output)}) does not match number of out_dims "
-                                    f"({len(self.out_dims_normalized)}). Expected {len(self.out_dims_normalized)} outputs."
-                                )
-                            
-                            for i, out_tensor in enumerate(output):
-                                # Note: indices only contains batch dimension slices (from slice_tuple)
-                                # For outputs with seq dimension, PyTorch will automatically handle it
-                                # For outputs without seq dimension, indices directly maps to the output shape
-                                if self.offload:
-                                    outputs[i][indices] = out_tensor.to(device="cpu")
-                                else:
-                                    outputs[i][indices] = out_tensor
-                            del output
-                        else:
-                            # Single output mode
-                            if isinstance(output, tuple):
-                                raise ValueError(
-                                    f"Forward function returned a tuple with {len(output)} outputs, but out_dims is None. "
-                                    f"To handle multiple outputs, please specify out_dims parameter when creating "
-                                    f"InferenceManager. For example: out_dims=[dim1, dim2, ...]"
-                                )
-                            if self.offload:
-                                # Move output to CPU before assigning to save GPU memory
-                                outputs[indices] = output.to(device="cpu")
-                            else:
-                                outputs[indices] = output
-                            del output
-
-                    # Delete batch to free memory
-                    del batch_dict
-
-                return outputs
-
-            except torch.cuda.OutOfMemoryError as e:
+                return self._run_batches(forward_fn, inputs, batch_dims, batch_size, output_shapes)
+            except torch.cuda.OutOfMemoryError as error:
                 if batch_size <= self.min_batch_size:
                     raise RuntimeError(
-                        f"Failed to execute even with minimum batch size {self.min_batch_size}. Error: {e}"
-                    )
-
+                        f"Failed to execute even with minimum batch size {self.min_batch_size}. Error: {error}"
+                    ) from error
+                next_batch_size = max(self.min_batch_size, batch_size // 2)
                 if self.verbose:
-                    print(
-                        f"OOM with batch_size={batch_size} for {self.enc_name}, "
-                        f"reducing to {max(self.min_batch_size, batch_size // 2)}"
-                    )
+                    print(f"OOM with batch_size={batch_size} for {self.enc_name}, reducing to {next_batch_size}")
 
-                # Clear CUDA memory and reduce batch size
+                # Release tensors held by the failed batch's stack frames.
+                error.__traceback__ = None
                 if self.exe_device.type == "cuda":
                     torch.cuda.empty_cache()
+                batch_size = next_batch_size
 
-                batch_size = max(self.min_batch_size, batch_size // 2)
+    def _run_batches(
+        self,
+        forward_fn: Callable,
+        inputs: Dict[str, Any],
+        batch_dims: Tuple[int, ...],
+        batch_size: int,
+        output_shapes: List[Tuple[int, ...]],
+    ) -> Tensor | Tuple[Tensor, ...]:
+        """Run one batch plan, preserving the configured output dtype policy."""
+        if batch_size >= math.prod(batch_dims):
+            return self._offload_outputs(self._run_forward(forward_fn, inputs))
+
+        input_dtype = next(iter(inputs.values())).dtype
+        output_device = torch.device("cpu") if self.offload else self.exe_device
+        split_sizes = self.compute_split_sizes(batch_dims, batch_size)
+        batch_iterator = self.create_multidim_batches(inputs, batch_dims, split_sizes)
+        if self.verbose:
+            batch_iterator = tqdm(
+                batch_iterator,
+                total=self.compute_n_batches(batch_dims, split_sizes),
+                desc=f"Processing {self.enc_name}",
+                unit="batch",
+            )
+
+        buffers = None
+        for batch_dict, indices in batch_iterator:
+            output = self._run_forward(forward_fn, batch_dict)
+            if self.out_dims is not None:
+                if not isinstance(output, tuple) or len(output) != len(output_shapes):
+                    raise ValueError(f"Expected a tuple of {len(output_shapes)} output tensors")
+                parts = output
+            else:
+                if isinstance(output, tuple):
+                    raise ValueError("Tuple outputs require out_dims to be specified")
+                parts = (output,)
+
+            if buffers is None:
+                # AMP may produce a different dtype for each output.
+                buffers = tuple(
+                    torch.empty(
+                        shape,
+                        dtype=part.dtype if self.preserve_output_dtype else input_dtype,
+                        device=output_device,
+                    )
+                    for shape, part in zip(output_shapes, parts)
+                )
+            for buffer, part in zip(buffers, parts):
+                buffer[indices] = part.to(output_device)
+            del output, parts, batch_dict, buffer, part
+
+        return buffers if self.out_dims is not None else buffers[0]
 
     @staticmethod
     def compute_split_sizes(batch_dims: Tuple[int], batch_size: int) -> List[int]:
